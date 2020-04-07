@@ -34,7 +34,7 @@ class RocketTile(
     crossing: ClockCrossingType)
   (implicit p: Parameters) extends BaseTile(rocketParams, crossing)(p)
     with HasExternalInterrupts
-    with HasLazyRoCC  // implies CanHaveSharedFPU with CanHavePTW with HasHellaCache
+    with HasPartialRoCC
     with HasHellaCache
     with HasICacheFrontend {
 
@@ -108,7 +108,7 @@ class RocketTile(
 
 class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
     with HasFpuOpt
-    with HasLazyRoCCModule
+    with HasPartialRoCCModule
     with HasICacheFrontendModule {
   Annotated.params(this, outer.rocketParams)
 
@@ -135,13 +135,12 @@ class RocketTileModuleImp(outer: RocketTile) extends BaseTileModuleImp(outer)
   fpuOpt foreach { fpu => core.io.fpu <> fpu.io }
   core.io.ptw <> ptw.io.dpath
 
-  if (outer.roccs.size > 0) {
-    cmdRouter.get.io.in <> core.io.rocc.cmd
-    outer.roccs.foreach(_.module.io.exception := core.io.rocc.exception)
-    core.io.rocc.resp <> respArb.get.io.out
-    core.io.rocc.busy <> (cmdRouter.get.io.busy || outer.roccs.map(_.module.io.busy).reduce(_ || _))
-    core.io.rocc.interrupt := outer.roccs.map(_.module.io.interrupt).reduce(_ || _)
-  }
+  // Use partial reconfiguration module
+  outer.partialrocc.module.io.cmd <> core.io.rocc.cmd
+  outer.partialrocc.module.io.exception := core.io.rocc.exception
+  core.io.rocc.resp <> outer.partialrocc.module.io.resp
+  core.io.rocc.busy := outer.partialrocc.module.io.busy
+  core.io.rocc.interrupt := outer.partialrocc.module.io.interrupt
 
   // Rocket has higher priority to DTIM than other TileLink clients
   outer.dtim_adapter.foreach { lm => dcachePorts += lm.module.io.dmem }

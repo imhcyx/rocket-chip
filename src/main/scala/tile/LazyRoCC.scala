@@ -4,6 +4,7 @@
 package freechips.rocketchip.tile
 
 import Chisel._
+import chisel3.experimental.dontTouch
 
 import freechips.rocketchip.config._
 import freechips.rocketchip.subsystem._
@@ -11,6 +12,7 @@ import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.rocket._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util.InOrderArbiter
+import scala.collection.mutable.ListBuffer
 
 case object BuildRoCC extends Field[Seq[Parameters => LazyRoCC]](Nil)
 
@@ -65,6 +67,131 @@ abstract class LazyRoCC(
 
 class LazyRoCCModuleImp(outer: LazyRoCC) extends LazyModuleImp(outer) {
   val io = IO(new RoCCIO(outer.nPTWPorts))
+}
+
+/** Module for RoCC partial reconfiguration **/
+
+class PartialRoCC(implicit p: Parameters) extends LazyModule {
+  val atlXbar = LazyModule(new TLXbar)
+  val tlXbar = LazyModule(new TLXbar)
+
+  val atldummy = TLClientNode(Seq(TLClientPortParameters(Seq(TLClientParameters("dummy_atl")))))
+  val tldummy = TLClientNode(Seq(TLClientPortParameters(Seq(TLClientParameters("dummy_tl")))))
+
+  atlXbar.node :=* atldummy
+  tlXbar.node :=* tldummy
+
+  val roccs = p(BuildRoCC).map(_(p))
+
+  roccs.map(_.atlNode).foreach { atl => atlXbar.node :=* atl }
+  roccs.map(_.tlNode).foreach { tl => tlXbar.node :=* tl }
+
+  val nPTWPorts = roccs.map(_.nPTWPorts).foldLeft(0)(_ + _)
+
+  require(nPTWPorts <= 1)
+
+  lazy val module = new PartialRoCCModuleImp(this)
+}
+
+class PartialRoCCModuleImp(outer: PartialRoCC) extends LazyModuleImp(outer) {
+
+  val io = IO(new Bundle {
+    val cmd = Decoupled(new RoCCCommand).flip
+    val resp = Decoupled(new RoCCResponse)
+    val mem = Vec(4, new HellaCacheIO)
+    val busy = Bool(OUTPUT)
+    val interrupt = Bool(OUTPUT)
+    val exception = Bool(INPUT)
+    val ptw = Vec(1, new TLBPTWIO)
+    val fpu_req = Decoupled(new FPInput)
+    val fpu_resp = Decoupled(new FPResult).flip
+  })
+  
+  dontTouch(auto)
+  dontTouch(io)
+
+  val ptwPorts = ListBuffer[TLBPTWIO]()
+  val dcachePorts = ListBuffer[HellaCacheIO]()
+
+  if (outer.roccs.size > 0) {
+    val respArb = Module(new RRArbiter(new RoCCResponse()(outer.p), outer.roccs.size))
+    val cmdRouter = Module(new RoccCommandRouter(outer.roccs.map(_.opcodes))(outer.p))
+    outer.roccs.zipWithIndex.foreach { case (rocc, i) =>
+      ptwPorts ++= rocc.module.io.ptw
+      rocc.module.io.cmd <> cmdRouter.io.out(i)
+      val dcIF = Module(new SimpleHellaCacheIF()(outer.p))
+      dcIF.io.requestor <> rocc.module.io.mem
+      dcachePorts +=  dcIF.io.cache
+      respArb.io.in(i) <> Queue(rocc.module.io.resp)
+    }
+
+    cmdRouter.io.in <> io.cmd
+    outer.roccs.foreach(_.module.io.exception := io.exception)
+    io.resp <> respArb.io.out
+    io.busy <> (cmdRouter.io.busy || outer.roccs.map(_.module.io.busy).reduce(_ || _))
+    io.interrupt := outer.roccs.map(_.module.io.interrupt).reduce(_ || _)
+
+    val nFPUPorts = outer.roccs.filter(_.usesFPU).size
+    if (nFPUPorts > 0) {
+      val fpArb = Module(new InOrderArbiter(new FPInput()(outer.p), new FPResult()(outer.p), nFPUPorts))
+      val fp_rocc_ios = outer.roccs.filter(_.usesFPU).map(_.module.io)
+      fpArb.io.in_req <> fp_rocc_ios.map(_.fpu_req)
+      fp_rocc_ios.zip(fpArb.io.in_resp).foreach {
+        case (rocc, arb) => rocc.fpu_resp <> arb
+      }
+      io.fpu_req <> fpArb.io.out_req
+      fpArb.io.out_resp <> io.fpu_resp
+    } else {
+      io.fpu_req.valid := Bool(false)
+      io.fpu_resp.ready := Bool(false)
+    }
+  }
+
+  ptwPorts ++= List.tabulate(1-ptwPorts.size) { _ =>
+    val port = Wire(new TLBPTWIO)
+    port.req.valid := Bool(false)
+    port
+  }
+  io.ptw zip ptwPorts foreach { case (ptw, port) =>
+    ptw := port
+  }
+
+  dcachePorts ++= List.tabulate(4-dcachePorts.size) { _ =>
+    val port = Wire(new HellaCacheIO)
+    port.req.valid := Bool(false)
+    port
+  }
+  io.mem zip dcachePorts foreach { case (mem, port) =>
+    mem := port
+  }
+}
+
+/** Module for RoCC partial reconfiguration **/
+
+trait HasPartialRoCC extends CanHavePTW { this : BaseTile =>
+  val roccs = List[LazyRoCC]()
+
+  nPTWPorts += 1
+  nDCachePorts += 4
+
+  val partialrocc = LazyModule(new PartialRoCC)
+
+  tlMasterXbar.node :=* partialrocc.atlXbar.node
+  tlOtherMastersNode :=* partialrocc.tlXbar.node
+}
+
+trait HasPartialRoCCModule extends CanHavePTWModule
+    with HasCoreParameters { this: RocketTileModuleImp with HasFpuOpt =>
+
+  ptwPorts ++= outer.partialrocc.module.io.ptw
+  dcachePorts ++= outer.partialrocc.module.io.mem
+  fpuOpt foreach { fpu =>
+    fpu.io.cp_req <> outer.partialrocc.module.io.fpu_req
+    outer.partialrocc.module.io.fpu_resp <> fpu.io.cp_resp
+  }
+
+  val respArb: Option[RRArbiter[RoCCResponse]] = None
+  val cmdRouter: Option[RoccCommandRouter] = None
 }
 
 /** Mixins for including RoCC **/
